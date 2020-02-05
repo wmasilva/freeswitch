@@ -1278,7 +1278,7 @@ cc_status_t cc_agent_update(const char *key, const char *value, const char *agen
 		switch_safe_free(sql);
 		result = CC_STATUS_SUCCESS;
 	} else if (!strcasecmp(key, "simo")) {
-		sql = switch_mprintf("UPDATE agents SET simo = '%d', system = 'single_box' WHERE name = '%q'", atoi(value), agent);
+		sql = switch_mprintf("UPDATE agents SET simo = '%d', instance_id = 'single_box' WHERE name = '%q'", atoi(value), agent);
 		cc_execute_sql(NULL, sql, NULL);
 		switch_safe_free(sql);
 		result = CC_STATUS_SUCCESS;
@@ -1745,8 +1745,8 @@ static switch_status_t load_config(void)
 	sql = switch_mprintf("update agents set state = 'Waiting', uuid = '' where instance_id = 'single_box';"
 						 "update tiers set state = 'Ready' where agent IN (select name from agents where instance_id = 'single_box');"
 						 "update members set state = '%q', session_uuid = '' where instance_id = '%q';"
-						 "update agents set external_calls_count = 0 where system = 'single_box';"
-						 "update agents set use_count = 0 where system = 'single_box';",
+						 "update agents set external_calls_count = 0 where instance_id = 'single_box';"
+						 "update agents set use_count = 0 where instance_id = 'single_box';",
 						 cc_member_state2str(CC_MEMBER_STATE_ABANDONED), globals.cc_instance_id);
 	cc_execute_sql(NULL, sql, NULL);
 	switch_safe_free(sql);
