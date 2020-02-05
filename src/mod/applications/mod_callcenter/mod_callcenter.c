@@ -254,7 +254,9 @@ static char agents_sql[] =
 "   calls_answered  INTEGER NOT NULL DEFAULT 0,\n"
 "   talk_time  INTEGER NOT NULL DEFAULT 0,\n"
 "   ready_time INTEGER NOT NULL DEFAULT 0,\n"
-"   external_calls_count INTEGER NOT NULL DEFAULT 0\n"
+"   external_calls_count INTEGER NOT NULL DEFAULT 0,\n"
+"   use_count INTEGER NOT NULL DEFAULT 0,\n"
+"   simo INTEGER NOT NULL DEFAULT 1\n"
 ");\n";
 
 static char tiers_sql[] =
@@ -1131,11 +1133,19 @@ cc_status_t cc_agent_update(const char *key, const char *value, const char *agen
 		}
 	} else if (!strcasecmp(key, "state")) {
 		if (cc_agent_str2state(value) != CC_AGENT_STATE_UNKNOWN) {
-			if (cc_agent_str2state(value) != CC_AGENT_STATE_RECEIVING) {
-				sql = switch_mprintf("UPDATE agents SET state = '%q' WHERE name = '%q'", value, agent);
-			} else {
+			if (cc_agent_str2state(value) == CC_AGENT_STATE_IDLE || cc_agent_str2state(value) == CC_AGENT_STATE_WAITING) {
+				sql = switch_mprintf(
+					"UPDATE agents SET state = '%q', use_count = 0 WHERE name = '%q' AND use_count <= 0;"
+					"UPDATE agents SET state = '%q' WHERE name = '%q' AND use_count > 0;",
+					value, agent,
+					cc_agent_state2str(CC_AGENT_STATE_IN_A_QUEUE_CALL), agent);
+			}
+			else if (cc_agent_str2state(value) == CC_AGENT_STATE_RECEIVING) {
 				sql = switch_mprintf("UPDATE agents SET state = '%q', last_offered_call = '%" SWITCH_TIME_T_FMT "' WHERE name = '%q'",
 						value, local_epoch_time_now(NULL), agent);
+			}
+			else {
+				sql = switch_mprintf("UPDATE agents SET state = '%q' WHERE name = '%q'", value, agent);
 			}
 			cc_execute_sql(NULL, sql, NULL);
 			switch_safe_free(sql);
@@ -1267,6 +1277,11 @@ cc_status_t cc_agent_update(const char *key, const char *value, const char *agen
 		cc_execute_sql(NULL, sql, NULL);
 		switch_safe_free(sql);
 		result = CC_STATUS_SUCCESS;
+	} else if (!strcasecmp(key, "simo")) {
+		sql = switch_mprintf("UPDATE agents SET simo = '%d', system = 'single_box' WHERE name = '%q'", atoi(value), agent);
+		cc_execute_sql(NULL, sql, NULL);
+		switch_safe_free(sql);
+		result = CC_STATUS_SUCCESS;
 	} else {
 		result = CC_STATUS_INVALID_KEY;
 		goto done;
@@ -1369,7 +1384,11 @@ cc_status_t cc_tier_update(const char *key, const char *value, const char *queue
 
 	if (!strcasecmp(key, "state")) {
 		if (cc_tier_str2state(value) != CC_TIER_STATE_UNKNOWN) {
-			sql = switch_mprintf("UPDATE tiers SET state = '%q' WHERE queue = '%q' AND agent = '%q'", value, queue_name, agent);
+			sql = switch_mprintf(
+				"UPDATE tiers SET state = '%q' WHERE queue = '%q' AND agent = '%q';"
+				"UPDATE tiers SET state = '%q' WHERE queue = '%q' AND agent = '%q' AND 1 = (SELECT count(name) FROM agents WHERE name = '%q' AND use_count > 0)",
+				value, queue_name, agent,
+				cc_tier_state2str(CC_TIER_STATE_ACTIVE_INBOUND), queue_name, agent, agent);
 			cc_execute_sql(NULL, sql, NULL);
 			switch_safe_free(sql);
 			result = CC_STATUS_SUCCESS;
@@ -1446,6 +1465,7 @@ static switch_status_t load_agent(const char *agent_name, switch_event_t *params
 		const char *busy_delay_time = switch_xml_attr(x_agent, "busy-delay-time");
 		const char *max_not_registered = switch_xml_attr(x_agent, "max-not-registered");
 		const char *not_registered_delay_time = switch_xml_attr(x_agent, "not-registered-delay-time");
+		const char *simo = switch_xml_attr(x_agent, "simo");
 
 		if (type) {
 			cc_status_t res = cc_agent_add(agent_name, type);
@@ -1483,7 +1503,9 @@ static switch_status_t load_agent(const char *agent_name, switch_event_t *params
 				if (not_registered_delay_time) {
 					cc_agent_update("not_registered_delay_time", not_registered_delay_time, agent_name);
 				}
-
+				if (simo) {
+					cc_agent_update("simo", simo, agent_name);
+				}
 				if (type && res == CC_STATUS_AGENT_ALREADY_EXIST) {
 					cc_agent_update("type", type, agent_name);
 				}
@@ -1696,6 +1718,8 @@ static switch_status_t load_config(void)
 									   "alter table agents add rejected_count integer not null default 0;"
 									   "alter table agents add busy_count integer not null default 0;"
 									   "alter table agents add not_registered_count integer not null default 0;");
+	switch_cache_db_test_reactive(dbh, "select count(use_count) from agents", NULL, "alter table agents add use_count integer not null default 0;"
+									   "alter table agents add simo integer not null default 1;");
 	/* This will rename column system for SQLite */
 	if (switch_cache_db_get_type(dbh) == SCDB_TYPE_CORE_DB) {
 		char *errmsg = NULL;
@@ -1721,7 +1745,8 @@ static switch_status_t load_config(void)
 	sql = switch_mprintf("update agents set state = 'Waiting', uuid = '' where instance_id = 'single_box';"
 						 "update tiers set state = 'Ready' where agent IN (select name from agents where instance_id = 'single_box');"
 						 "update members set state = '%q', session_uuid = '' where instance_id = '%q';"
-						 "update agents set external_calls_count = 0 where instance_id = 'single_box';",
+						 "update agents set external_calls_count = 0 where system = 'single_box';"
+						 "update agents set use_count = 0 where system = 'single_box';",
 						 cc_member_state2str(CC_MEMBER_STATE_ABANDONED), globals.cc_instance_id);
 	cc_execute_sql(NULL, sql, NULL);
 	switch_safe_free(sql);
@@ -2245,7 +2270,7 @@ static void *SWITCH_THREAD_FUNC outbound_agent_thread_run(switch_thread_t *threa
 			switch_channel_set_variable_printf(member_channel, "cc_queue_answered_epoch", "%" SWITCH_TIME_T_FMT, local_epoch_time_now(NULL));
 			/* Set UUID of the Agent channel */
 			sql = switch_mprintf("UPDATE agents SET uuid = '%q', last_bridge_start = '%" SWITCH_TIME_T_FMT "', calls_answered = calls_answered + 1, no_answer_count = 0"
-								 ", rejected_count = 0, busy_count = 0, not_registered_count = 0"
+								 ", rejected_count = 0, busy_count = 0, not_registered_count = 0, use_count = use_count + 1"
 								 " WHERE name = '%q' AND instance_id = '%q'",
 								 agent_uuid, local_epoch_time_now(NULL),
 								 h->agent_name, h->agent_system);
@@ -2298,7 +2323,7 @@ static void *SWITCH_THREAD_FUNC outbound_agent_thread_run(switch_thread_t *threa
 
 			/* Update Agents Items */
 			/* Do not remove uuid of the agent if we are a standby agent */
-			sql = switch_mprintf("UPDATE agents SET %s last_bridge_end = %" SWITCH_TIME_T_FMT ", talk_time = talk_time + (%" SWITCH_TIME_T_FMT "-last_bridge_start) WHERE name = '%q' AND instance_id = '%q';"
+			sql = switch_mprintf("UPDATE agents SET %s last_bridge_end = %" SWITCH_TIME_T_FMT ", talk_time = talk_time + (%" SWITCH_TIME_T_FMT "-last_bridge_start), use_count = use_count - 1 WHERE name = '%q' AND instance_id = '%q';"
 					, (strcasecmp(h->agent_type, CC_AGENT_TYPE_UUID_STANDBY)?"uuid = '',":""), local_epoch_time_now(NULL), local_epoch_time_now(NULL), h->agent_name, h->agent_system);
 			cc_execute_sql(NULL, sql, NULL);
 			switch_safe_free(sql);
@@ -2407,9 +2432,11 @@ done:
 	/* Make Agent Available Again */
 	sql = switch_mprintf(
 			"UPDATE tiers SET state = '%q' WHERE agent = '%q' AND queue = '%q' AND (state = '%q' OR state = '%q' OR state = '%q');"
-			"UPDATE tiers SET state = '%q' WHERE agent = '%q' AND NOT queue = '%q' AND state = '%q'"
+			"UPDATE tiers SET state = '%q' WHERE agent = '%q' AND NOT queue = '%q' AND state = '%q';"
+			"UPDATE tiers SET state = '%q' WHERE agent = '%q' AND 1 = (SELECT count(name) FROM agents WHERE name = '%q' AND use_count > 0);"
 			, cc_tier_state2str(tiers_state), h->agent_name, h->queue_name, cc_tier_state2str(CC_TIER_STATE_ACTIVE_INBOUND), cc_tier_state2str(CC_TIER_STATE_STANDBY), cc_tier_state2str(CC_TIER_STATE_OFFERING),
-			cc_tier_state2str(CC_TIER_STATE_READY), h->agent_name, h->queue_name, cc_tier_state2str(CC_TIER_STATE_STANDBY));
+			cc_tier_state2str(CC_TIER_STATE_READY), h->agent_name, h->queue_name, cc_tier_state2str(CC_TIER_STATE_STANDBY),
+			cc_tier_state2str(CC_TIER_STATE_ACTIVE_INBOUND), h->agent_name, h->agent_name);
 	cc_execute_sql(NULL, sql, NULL);
 	switch_safe_free(sql);
 
@@ -2479,6 +2506,9 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 	const char *agent_type = argv[16];
 	const char *agent_uuid = argv[17];
 	const char *agent_external_calls_count = argv[18];
+	const char *agent_use_count = argv[26];
+	const char *agent_simo = argv[27];
+
 
 	switch_bool_t contact_agent = SWITCH_TRUE;
 
@@ -2506,10 +2536,14 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 	cbt->tier_agent_available++;
 
 	/* If Agent is not in a acceptable tier state, continue */
-	if (! (!strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_NO_ANSWER)) || !strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_READY)))) {
+	if (! (!strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_NO_ANSWER)) ||
+		   !strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_READY)) ||
+		   !strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_ACTIVE_INBOUND)) ||
+		   !strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_STANDBY)))) {
 		contact_agent = SWITCH_FALSE;
 	}
-	if (! (!strcasecmp(agent_state, cc_agent_state2str(CC_AGENT_STATE_WAITING)))) {
+	if (! (!strcasecmp(agent_state, cc_agent_state2str(CC_AGENT_STATE_WAITING)) ||
+		   (!strcasecmp(agent_state, cc_agent_state2str(CC_AGENT_STATE_IN_A_QUEUE_CALL)) && ((atoi(agent_use_count) + atoi(agent_external_calls_count)) < atoi(agent_simo))))) {
 		contact_agent = SWITCH_FALSE;
 	}
 	if (! (atol(agent_last_bridge_end) < ((long) local_epoch_time_now(NULL) - atol(agent_wrap_up_time)))) {
@@ -2805,14 +2839,14 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 			switch_core_session_rwunlock(member_session);
 		}
 
-		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, agents.last_offered_call as agents_last_offered_call, 1 as dyn_order"
+		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, use_count, simo, agents.last_offered_call as agents_last_offered_call, 1 as dyn_order"
 				" FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
 				" WHERE tiers.queue = '%q'"
 				" AND (agents.status = '%q' OR agents.status = '%q' OR agents.status = '%q')"
 				" AND tiers.position > %d"
 				" AND tiers.level = %d"
 				" UNION "
-				"SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, agents.last_offered_call as agents_last_offered_call, 2 as dyn_order FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
+				"SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, use_count, simo, agents.last_offered_call as agents_last_offered_call, 2 as dyn_order FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
 				" WHERE tiers.queue = '%q'"
 				" AND (agents.status = '%q' OR agents.status = '%q' OR agents.status = '%q')"
 				" AND tiers.level > %d"
@@ -2826,14 +2860,14 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 				level
 				);
 	} else if (!strcasecmp(queue->strategy, "round-robin")) {
-		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, agents.last_offered_call as agents_last_offered_call, 1 as dyn_order"
+		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, use_count, simo, agents.last_offered_call as agents_last_offered_call, 1 as dyn_order"
 				" FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
 				" WHERE tiers.queue = '%q'"
 				" AND (agents.status = '%q' OR agents.status = '%q' OR agents.status = '%q')"
 				" AND tiers.position > (SELECT tiers.position FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent) WHERE tiers.queue = '%q' AND agents.last_offered_call > 0 ORDER BY agents.last_offered_call DESC LIMIT 1)"
 				" AND tiers.level = (SELECT tiers.level FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent) WHERE tiers.queue = '%q' AND agents.last_offered_call > 0 ORDER BY agents.last_offered_call DESC LIMIT 1)"
 				" UNION "
-				"SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, agents.last_offered_call as agents_last_offered_call, 2 as dyn_order"
+				"SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position as tiers_position, tiers.level as tiers_level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, use_count, simo, agents.last_offered_call as agents_last_offered_call, 2 as dyn_order"
 				" FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
 				" WHERE tiers.queue = '%q'"
 				" AND (agents.status = '%q' OR agents.status = '%q' OR agents.status = '%q')"
@@ -2869,7 +2903,7 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 			sql_order_by = switch_mprintf("level, position, agents.last_offered_call");
 		}
 
-		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position, tiers.level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time"
+		sql = switch_mprintf("SELECT instance_id, name, status, contact, no_answer_count, max_no_answer, reject_delay_time, busy_delay_time, no_answer_delay_time, tiers.state, agents.last_bridge_end, agents.wrap_up_time, agents.state, agents.ready_time, tiers.position, tiers.level, agents.type, agents.uuid, external_calls_count, rejected_count, busy_count, not_registered_count,max_rejected, max_busy, max_not_registered, not_registered_delay_time, use_count, simo"
 				" FROM agents LEFT JOIN tiers ON (agents.name = tiers.agent)"
 				" WHERE tiers.queue = '%q'"
 				" AND (agents.status = '%q' OR agents.status = '%q' OR agents.status = '%q')"
