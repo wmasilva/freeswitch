@@ -1161,6 +1161,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		switch_channel_t *channel;
 		switch_caller_profile_t *caller_profile;
 		switch_event_t *clone = NULL;
+		const char *loopback_initial_codec = switch_event_get_header(var_event, "loopback_initial_codec");
 
 		switch_core_session_add_stream(*new_session, NULL);
 
@@ -1172,6 +1173,11 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 				switch_channel_set_variable(channel, "loopback_leg", "A");
 				switch_channel_set_variable(channel, "is_loopback", "1");
 			}
+
+			if (loopback_initial_codec) {
+				switch_channel_set_variable(channel, "loopback_initial_codec", loopback_initial_codec);
+			}
+
 			if (tech_init(tech_pvt, *new_session, session ? switch_core_session_get_read_codec(session) : NULL) != SWITCH_STATUS_SUCCESS) {
 				switch_core_session_destroy(new_session);
 				return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
