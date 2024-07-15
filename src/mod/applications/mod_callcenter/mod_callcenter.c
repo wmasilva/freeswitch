@@ -1922,6 +1922,8 @@ static void *SWITCH_THREAD_FUNC outbound_agent_thread_run(switch_thread_t *threa
 			switch_safe_free(sql);
 
 			if (atoi(res) == 0) {
+				/* Unexpected, it's possible the agent channel wasn't created when the agent that won the race was connected, so hangup the channel */
+				switch_channel_hangup(switch_core_session_get_channel(agent_session), SWITCH_CAUSE_LOSE_RACE);
 				goto done;
 			}
 			switch_core_session_hupall_matching_var("cc_member_pre_answer_uuid", h->member_uuid, SWITCH_CAUSE_LOSE_RACE);
